@@ -45,6 +45,7 @@
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <protocol.h>
+#include <psbt.h>
 #include <random.h>
 #include <scheduler.h>
 #include <script/script.h>
@@ -497,12 +498,66 @@ struct CNodeState {
     int64_t m_last_block_announcement{0};
 };
 
+/** For each blocks store the best PSBT conbination with all signatures seen
+ * Use this cache to avoid spaming your peers with blocks and psbt that they have
+ * already seen. Only should relay a finalized block if finalize = true, meaning
+ * that it has all needed signatures.
+ * Empty the cache with clean_cache when a new block is found.
+*/
+struct PeerPSBTCache {
+
+    /** For each block seen, store the best combined PSBT
+     * and if the PSBT has enough signatures */
+    struct BlockSignatureState {
+        PartiallySignedTransaction m_bestpsbt;
+        /** If we reached the min threashold */
+        bool finalized{false};
+    };
+
+    /** Store for each block the best PSBT*/
+    std::map<uint256, BlockSignatureState> m_block_sigs;
+
+    /** Empty the cache. Should be called when a new block is found */
+    void clean_cache()
+    {
+        m_block_sigs.clear();
+    };
+
+    /** Add the signatures and signers that we don't have cache.
+     * Returns true if the PSBT changed and should be retransmited to all peers. */
+    bool add_signers(uint256 block_hash, PartiallySignedTransaction psbt)
+    {
+        bool merge_succeed = m_block_sigs[block_hash].m_bestpsbt.Merge(psbt);
+        if (!merge_succeed)
+        {
+            LogDebug(BCLog::SIGNETPSBT, "Merge the PSBTs was not possible, returned an error.\n");
+        }
+        else
+        {
+            size_t unsigned_inputs = CountPSBTUnsignedInputs(m_block_sigs[block_hash].m_bestpsbt);
+            if(unsigned_inputs == 0)
+            {
+                LogDebug(BCLog::SIGNETPSBT, "The PSBT has the needed signatures and can be retransmited.\n");
+                m_block_sigs[block_hash].finalized = true;
+            }
+            LogDebug(BCLog::SIGNETPSBT, "PSBTs merged, missing %d signatures.\n", unsigned_inputs);
+            return true;
+        }
+
+        return false;
+    }
+};
+
+
 class PeerManagerImpl final : public PeerManager
 {
 public:
     PeerManagerImpl(CConnman& connman, AddrMan& addrman,
                     BanMan* banman, ChainstateManager& chainman,
                     CTxMemPool& pool, node::Warnings& warnings, Options opts);
+
+    /** Cache used to store the PSBTs for each block */
+    PeerPSBTCache psbt_cache;
 
     /** Overridden from CValidationInterface. */
     void ActiveTipChange(const CBlockIndex& new_tip, bool) override
